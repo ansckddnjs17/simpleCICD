@@ -1,0 +1,16 @@
+name: CI/CD Practice
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 코드 가져오기
+        uses: actions/checkout@v6
+
+      - name: Docker 이미지 빌드
+        run: docker build -t simple-cicd .
