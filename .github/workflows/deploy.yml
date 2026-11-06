@@ -3,17 +3,27 @@ name: CI/CD Practice
 on:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
   packages: write
+  id-token: write
+
+# 한 번에 하나의 배포만 실행
+concurrency:
+  group: deploy-ec2
+  cancel-in-progress: false
 
 env:
   IMAGE: ghcr.io/ansckddnjs17/simplecicd
+  AWS_REGION: ap-northeast-2
+  SECURITY_GROUP_ID: sg-062709523360bdb34
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: 코드 가져오기
@@ -31,3 +41,100 @@ jobs:
 
       - name: Docker 이미지 업로드
         run: docker push "$IMAGE:$GITHUB_SHA"
+
+      - name: AWS 임시 권한 받기
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::637423429729:role/simple-cicd-github-deploy
+          aws-region: ap-northeast-2
+
+      - name: SSH 접속 준비
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/ec2_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/ec2_key ~/.ssh/known_hosts
+
+      - name: Actions 서버의 SSH 접근 허용
+        id: allow_ssh
+        run: |
+          RUNNER_IP=$(curl -4 -fsS --retry 3 https://checkip.amazonaws.com)
+
+          RULE_ID=$(aws ec2 authorize-security-group-ingress \
+            --group-id "$SECURITY_GROUP_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "$RUNNER_IP/32" \
+            --query 'SecurityGroupRules[0].SecurityGroupRuleId' \
+            --output text)
+
+          echo "rule_id=$RULE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: EC2에 배포
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          SSH_OPTIONS=(
+            -i ~/.ssh/ec2_key
+            -o BatchMode=yes
+            -o StrictHostKeyChecking=yes
+            -o ConnectTimeout=10
+          )
+
+          # 보안 그룹 규칙 반영을 기다리며 접속 확인
+          CONNECTED=false
+          for attempt in {1..12}; do
+            if ssh "${SSH_OPTIONS[@]}" "$EC2_USER@$EC2_HOST" true; then
+              CONNECTED=true
+              break
+            fi
+            sleep 5
+          done
+          if [ "$CONNECTED" != true ]; then
+            echo "EC2 SSH 접속 실패"
+            exit 1
+          fi
+
+          ssh "${SSH_OPTIONS[@]}" "$EC2_USER@$EC2_HOST" \
+            "bash -s -- '$IMAGE:$GITHUB_SHA'" <<'REMOTE'
+          set -e
+          IMAGE="$1"
+
+          docker pull "$IMAGE"
+          docker rm -f demo || true
+
+          docker run -d \
+            --name demo \
+            --restart unless-stopped \
+            -p 80:80 \
+            "$IMAGE"
+
+          # 웹 서버가 정상 응답하는지 확인
+          for attempt in {1..10}; do
+            if curl --fail --silent http://localhost/; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs demo
+          exit 1
+          REMOTE
+
+      - name: 임시 SSH 접근 규칙 제거
+        if: ${{ always() && steps.allow_ssh.outputs.rule_id != '' }}
+        env:
+          RULE_ID: ${{ steps.allow_ssh.outputs.rule_id }}
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --group-id "$SECURITY_GROUP_ID" \
+            --security-group-rule-ids "$RULE_ID"
+
+      - name: SSH 키 파일 정리
+        if: always()
+        run: rm -f ~/.ssh/ec2_key
